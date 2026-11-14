@@ -1,0 +1,792 @@
+#!/bin/bash
+#
+# Copyright 2004, ..., 2017  Jean-Philippe Guillemin <h1p8r10n@yandex.com>
+# All rights reserved.
+#
+#   Permission to use, copy, modify, and distribute this patch for
+#   any purpose with or without fee is hereby granted, provided that
+#   the above copyright notice and this permission notice appear in all
+#   copies.
+#
+#   THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESSED OR IMPLIED
+#   WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+#   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+#   IN NO EVENT SHALL THE AUTHORS AND COPYRIGHT HOLDERS AND THEIR
+#   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+#   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+#   USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+#   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+#   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+#   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+#   SUCH DAMAGE.
+
+. /etc/shell-colors
+
+export CWD=$(pwd)
+
+if [[ "$1" = "" ]]; then
+  echo -e "${BOLDCYAN}This tool creates Slackware packages from source source-tarball-version.tar.?z|zip ${COLOR_RESET}"
+  echo -e "${BOLDCYAN}This tool creates Slackware packages from binary DEB or RPM packages ${COLOR_RESET}"
+  echo -e "${BOLDCYAN}This tool creates Slackware packages from GIT URL ${COLOR_RESET}"
+  echo -e "${BOLDCYAN}usage $0 TARBALL [ \"VERSION\" \"NAME\" ] ${COLOR_RESET}"
+  echo -e "${BOLDCYAN}optional environment variables are : \$OUTPUT \$VERSION \$BUILD \$EXTRACONFIG${COLOR_RESET}"
+  exit
+fi
+
+export ME=$(which $0)
+export JOBS=$(nproc)
+
+export SRCPKG="$(basename "$1")"
+shift
+[[ "$1" != "" ]] && export VERSION="$1" && shift
+[[ "$1" != "" ]] && export NAME="$1"
+
+# $1 can be either a real filename sitting in CWD (e.g. "foo-1.2.3.tar.gz")
+# or just a bare package NAME, in which case we glob for a matching source
+# archive/recipe next to the script.
+
+if [[ "${NAME}" == "" ]] ; then
+  if [[ -e ${CWD}/"$SRCPKG" ]]; then
+    # A real file was given: derive NAME by stripping the trailing
+    # "-version.ext" field(s) from the filename, e.g. "foo-bar-1.2.3.tar.gz" -> "foo-bar"
+    nbfields=$(tr -dc '-' <<< "$SRCPKG" | wc -c)
+    nbfields=$(($nbfields - 1))
+    IFS='-' read -ra field <<< "$SRCPKG"
+    NAME="${field[0]}"
+    for i in $(seq 1 $nbfields); do export NAME="$NAME-${field[$i]}"; done
+  else
+    # No matching file: treat $1 as NAME and look for a source archive,
+    # binary package, or build recipe (.pip/.url/.git) that starts with it.
+    export NAME="$SRCPKG"
+    SRCPKG="$(ls ${NAME}*tar* 2>/dev/null || ls ${NAME}*zip 2>/dev/null || ls ${NAME}*z 2>/dev/null || ls ${NAME}*rpm 2>/dev/null || ls ${NAME}*deb 2>/dev/null || ls ${NAME}*pip 2>/dev/null || ls ${NAME}*url 2>/dev/null || ls ${NAME}*git 2>/dev/null || exit 1) "
+    [ ! -e ${CWD}/$(basename "$SRCPKG") ] && exit 1
+  fi
+fi
+# BUILD defaults to today's date (YYMMDD) unless the caller exported one
+if [[ "${BUILD}" == "" ]] ; then
+  export BUILD="$(date '+%y%m%d')"
+else
+  export BUILD
+fi
+
+# VERSION defaults to whatever comes after the last "-" in the archive
+# name, with the extension(s) stripped first. For "foo.tar.gz" that means
+# stripping ".gz" then ".tar"; for anything else, just the last extension.
+if [[ "${VERSION}" == "" ]] ; then
+  if [[ "$(echo $SRCPKG | grep 'tar.')" ]] ; then
+    VERSION=${SRCPKG%.*}; VERSION=${VERSION%.*}; export VERSION=${VERSION##*-}
+  else
+    VERSION=${SRCPKG%.*}; export VERSION=${VERSION##*-}
+  fi
+else
+  export VERSION
+fi
+
+# Standard Zenwalk/Slackware 64-bit build environment: lib64, -fPIC
+# everywhere, and a fresh scratch dir (${TMP}) to extract the source into.
+export ARCH=${ARCH:=x86_64}
+export CFLAGS="-O2 -fPIC"
+export CXXFLAGS="-O2 -fPIC"
+export CMAKEFLAGS="-O2 -fpic"
+export LIBDIRSUFFIX="64"
+export PREFIX=/usr
+export LIBINSTALLDIR=${PREFIX}/lib64
+export ICEAUTH=${PREFIX}/bin/iceauth
+export EXTRACONFIG
+export TMP="${CWD}/tmp"
+
+cd ${CWD}
+rm -rf ${TMP}
+mkdir -p ${TMP}
+echo -e "${BOLDCYAN}Extracting source ${SRCPKG} ${COLOR_RESET}"
+
+##############################################################
+# Extract / fetch the source according to its type, and prepare
+# a NAME-build.sh for the package types that need a custom recipe
+##############################################################
+cd ${TMP}
+
+# Dispatch on the source package's extension. Plain archives (gz/xz/bz2/zip)
+# are just extracted. The other branches instead write a NAME-build.sh
+# recipe to ${CWD}, which gets sourced later once ${PKG} exists (see the
+# "if [[ -e ${CWD}/${NAME}-build.sh ]]" step further down).
+case ${SRCPKG##*.} in
+gz)
+  tar zxvf ${CWD}/${SRCPKG} || exit 1
+  ;;
+xz)
+  tar Jxvf ${CWD}/${SRCPKG} || exit 1
+  ;;
+bz2)
+  tar jxvf ${CWD}/${SRCPKG} || exit 1
+  ;;
+zip)
+  unzip ${CWD}/${SRCPKG} || exit 1
+  ;;
+url)
+  # ${SRCPKG} is a text file whose first field is a download URL
+  URL=$(cut -f1 -d" " ${CWD}/${SRCPKG})
+  wget --no-check-certificate $URL
+  tar xvf ./*.*z* || unzip ./*.zip || exit 1
+  rm ./*.*z* || exit 1
+  ;;
+git)
+  # ${SRCPKG} is a text file whose first field is a git URL.
+  # VERSION controls what gets checked out:
+  #   MASTER -> track the master branch, tag the build as GIT<BUILD-date>
+  #   LATEST -> checkout the most recent tag
+  #   anything else -> checkout that exact tag
+  URL="$(cut -f1 -d" " ${CWD}/${SRCPKG})"
+  git clone ${URL} || exit 1
+  cd $(ls -d ${TMP}/*/)
+  git submodule update --init --recursive
+  if [[ "${VERSION}" == "MASTER" ]] ; then
+    git checkout master
+    export VERSION="GIT$BUILD"
+  elif [[ "${VERSION}" == "LATEST" ]] ; then
+    TAG="$(git describe --tags --abbrev=0)"
+    git checkout tags/$TAG
+    export VERSION="$(echo $TAG | tr '-' '.' | tr '_' '.' | tr -d 'v')"
+  else
+    TAG="$(cut -f2 -d" " ${CWD}/${SRCPKG})"
+    [[ "$TAG" == "" ]] && TAG="${VERSION}"
+    git checkout tags/$TAG
+  fi
+  ;;
+rpm)
+  # Unpack the RPM's cpio payload straight into ${PKG} once it exists
+  mkdir ${TMP}/${NAME}-rpm
+  rpm2cpio ${CWD}/${SRCPKG} > ${TMP}/${NAME}-rpm/pkg.cpio 2> /dev/null || exit 1
+  cat << "END" > ${CWD}/${NAME}-build.sh
+  ( cd ${PKG} ; cpio -i -m -d < ${TMP}/${NAME}-rpm/pkg.cpio 1> /dev/null 2> /dev/null )
+END
+  ;;
+deb)
+  # Extract the .deb's data.tar.* (the actual file payload) into ${PKG},
+  # discarding the ar container's control/metadata members
+  mkdir ${TMP}/${NAME}-deb
+  cat << "END" > ${CWD}/${NAME}-build.sh
+  cd ${PKG} || exit 1
+  ar x ${CWD}/${SRCPKG}
+  tar -xvf data.tar.*z* || exit 1
+  rm -rf data*
+  rm -rf control*
+  rm -rf debian*
+END
+  ;;
+AppImage)
+  # Repackage an AppImage as a regular binary + its desktop file/icon.
+  # Binaries are never stripped here since the AppImage is shipped as-is.
+  export STRIP="OFF"
+  mkdir ${TMP}/${NAME}-AppImage
+  cat << "END" > ${CWD}/${NAME}-build.sh
+chmod 755 ${CWD}/${SRCPKG}
+${CWD}/${SRCPKG} --appimage-extract
+mkdir -p ${PKG}/usr/share/applications
+find ${SRC} -name "*${NAME}*.desktop" -print0 | head -n1 | xargs -0 -I % cp -f "%" ${PKG}/usr/share/applications/
+grep -rl "NoDisplay" ${PKG}/usr/share/applications/* | xargs rm -f
+sed -i "s/^Exec=.*$/Exec=$NAME  %U/g" ${PKG}/usr/share/applications/*.desktop
+sed -i "s/^TryExec=.*$/Exec=$NAME  %U/g" ${PKG}/usr/share/applications/*.desktop
+mkdir -p ${PKG}/usr/share/icons/hicolor/48x48/apps
+find ${SRC} -name "*${NAME}*.png" -print0 | head -n1 | xargs -0 -I % cp -f "%" ${PKG}/usr/share/icons/hicolor/48x48/apps/
+mkdir -p ${PKG}/usr/bin
+cp ${CWD}/${SRCPKG} ${PKG}/usr/bin/${NAME}
+chmod 755 ${PKG}/usr/bin/${NAME}
+END
+  ;;
+skel)
+  # ${SRCPKG} is a directory tree to copy verbatim into ${PKG}
+  mkdir ${TMP}/${NAME}-skel
+  cat << "END" > ${CWD}/${NAME}-build.sh
+cd ${PKG} || exit 1
+cp -rpf ${CWD}/${SRCPKG}/* ./
+END
+  ;;
+pkg)
+  # Placeholder: no extraction/build step, an existing NAME-build.sh
+  # (or a fully custom flow) is expected to populate ${PKG} itself
+  mkdir ${TMP}/${NAME}-pkg
+  ;;
+txz)
+  # Re-installing an already-built Slackware package
+  mkdir ${TMP}/${NAME}-txz
+  cat << "END" > ${CWD}/${NAME}-build.sh
+cd ${PKG} || exit 1
+tar xvf ${CWD}/${SRCPKG} || exit 1
+bash install/doinst.sh
+END
+  ;;
+pip)
+  # Install a PyPI module into ${PKG} instead of the live system
+  MODULE="${NAME}"
+  NAME="${NAME}"
+  mkdir ${TMP}/${NAME}-pip
+  cat << "END" > ${CWD}/${NAME}-build.sh
+mkdir -p $PKG/usr/lib64/python$(python3 -V | sed -n "s|^Python \([0-9\.]\{3\}\).*$|\1|p")/site-packages
+pip install --no-deps --root ${PKG} ${MODULE}
+END
+  ;;
+*)
+  # Unknown extension: let tar auto-detect the compression
+  tar xvf ${CWD}/${SRCPKG} || exit 1
+  ;;
+esac
+
+# ${PKG} is the staging root that will become the .txz package
+# (everything "make install DESTDIR=${PKG}" writes ends up here)
+export PKG="${OUTPUT:=/tmp}/PKG_SKEL_${NAME}-${VERSION//-/}-${ARCH}-$BUILD"
+rm -rf ${PKG}
+rm -f ${PKG}.txz
+mkdir -p ${PKG}
+
+# ${SRC} is the top-level directory the archive extracted into (its name
+# varies with the release, e.g. "foo-1.2.3/"), so just glob for it
+export SRC=$(ls -d ${TMP}/*/)
+
+##############################################################
+cd ${SRC} || export SRC=${TMP} && cd ${SRC}
+
+# some custom pre build instructions
+if [[ -e ${CWD}/${NAME}-prebuild.sh ]]; then
+  echo -e "${BOLDCYAN}Executing prebuild script${COLOR_RESET}"
+  bash ${CWD}/${NAME}-prebuild.sh
+elif [[ -e ${CWD}/prebuild.sh ]]; then
+  echo -e "${BOLDCYAN}Executing prebuild script${COLOR_RESET}"
+  bash ${CWD}/prebuild.sh
+fi
+
+# Sorry , but fed up with these :/
+rm -f /usr/lib64/*.la
+
+# unless you need to fix things..
+# alias make="make -s"
+
+# Shared build routine for the Makefile-based paths (classic configure and
+# cmake). Tries "make check" first; if there's no check target (or it
+# fails) falls back to a plain build, then installs into ${PKG}.
+makebuild(){
+  make -j${JOBS} prefix=${PREFIX} libdir=${LIBINSTALLDIR} mandir=${PREFIX}/man PREFIX=${PREFIX} LIBDIR=${LIBINSTALLDIR} check || \
+  make -j${JOBS} prefix=${PREFIX} libdir=${LIBINSTALLDIR} mandir=${PREFIX}/man PREFIX=${PREFIX} LIBDIR=${LIBINSTALLDIR} || exit 1
+  make install DESTDIR=${PKG} prefix=${PREFIX} libdir=${LIBINSTALLDIR} mandir=${PREFIX}/man PREFIX=${PREFIX} LIBDIR=${LIBINSTALLDIR} || exit 1
+}
+
+# Default autotools ./configure flags; overridden below for meson/python/perl,
+# and can be fully replaced by a NAME-configure.sh or configure.sh script.
+export CONFIG="\
+--prefix=${PREFIX} \
+--mandir=${PREFIX}/man \
+--docdir=${PREFIX}/doc/${NAME}-${VERSION} \
+--libdir=${LIBINSTALLDIR} \
+--localstatedir=/var \
+--localedir=${PREFIX}/share/locale \
+--sysconfdir=/etc \
+--enable-static=no \
+--disable-static \
+--enable-shared \
+--enable-final \
+--disable-debug \
+--disable-schemas-compile \
+--enable-gio \
+--enable-gtk-doc=no \
+--enable-gtk-doc-html=no \
+--enable-gtk3 \
+--with-gtk=3 \
+--enable-introspection \
+--enable-notifications \
+--disable-libsystemd-login \
+--build=${ARCH}-slackware-linux ${EXTRACONFIG} \
+"
+
+# Apply every NAME-*.patch found next to the script, in glob order
+echo -e "${BOLDCYAN}Aplying patches ${COLOR_RESET}"
+for PATCH in $(ls $CWD/${NAME}-*.patch) ; do
+  echo "From $PATCH >>>"
+  patch -p1 < ${PATCH}
+done
+
+echo -e "${BOLDCYAN}About to build ${NAME} ${COLOR_RESET}"
+echo -e "${BOLDCYAN}Using source ${SRCPKG} ${COLOR_RESET}"
+echo -e "${BOLDCYAN}output package will be ${OUTPUT:=/tmp}/${NAME}-${VERSION//-/}-${ARCH}-$BUILD.txz ${COLOR_RESET}"
+
+# Build dispatcher. A custom NAME-build.sh (or generic build.sh) always
+# wins if present — including the recipes auto-generated by the case
+# block above for rpm/deb/AppImage/skel/txz/pip sources. Otherwise fall
+# back to auto-detecting the build system from files in ${SRC}.
+if [[ -e ${CWD}/${NAME}-build.sh ]]; then
+  echo -e "${BOLDCYAN}Executing ${NAME}-build.sh ${COLOR_RESET}"
+  sleep 2
+  bash ${CWD}/${NAME}-build.sh
+
+elif [[ -e ${CWD}/build.sh ]]; then
+  echo -e "${BOLDCYAN}Executing build.sh ${COLOR_RESET}"
+  sleep 2
+  bash ${CWD}/build.sh
+
+# Else let's try to be automagic :
+
+# MESON
+elif [[ -e ${SRC}/meson.build ]]; then
+  echo -e "${BOLDCYAN}Building and installing source (MESON)${COLOR_RESET}"
+  export CONFIG="\
+-Dprefix=${PREFIX} \
+-Dmandir=${PREFIX}/man \
+-Dlibdir=${LIBINSTALLDIR} \
+-Dlocalstatedir=/var \
+-Dlocaledir=${PREFIX}/share/locale \
+-Dsysconfdir=/etc \
+"
+  # Do we have custom $CONFIG ? then overwrite it here...
+  if [[ -e ${CWD}/${NAME}-configure.sh ]]; then
+    source ${CWD}/${NAME}-configure.sh
+  elif [[ -e ${CWD}/configure.sh ]]; then
+    source ${CWD}/configure.sh
+  fi
+  sleep 2
+  echo -e "${BOLDCYAN}Configure options are : ${CONFIG} ${COLOR_RESET}"
+  mkdir builddir
+  (
+    meson setup ${CONFIG} builddir
+    meson compile -C builddir
+    meson test -C builddir
+    DESTDIR=${PKG} meson install -C builddir
+  )
+
+# PYTHON
+elif [[ -e ${SRC}/setup.py ]]; then
+  echo -e "${BOLDCYAN}Building and installing source (PYTHON)${COLOR_RESET}"
+  export CONFIG="\
+--prefix=${PREFIX} --root=${PKG} \
+"
+  # Do we have custom $CONFIG ? then overwrite it here...
+  if [[ -e ${CWD}/${NAME}-configure.sh ]]; then
+    source ${CWD}/${NAME}-configure.sh
+  elif [[ -e ${CWD}/configure.sh ]]; then
+    source ${CWD}/configure.sh
+  fi
+  echo -e "${BOLDCYAN}Configure options are : ${CONFIG} ${COLOR_RESET}"
+  sleep 2
+  python3 setup.py install ${CONFIG}
+  # python2 setup.py install ${CONFIG} || exit
+
+# PERL
+elif [[ -e ${SRC}/Makefile.PL ]]; then
+  echo -e "${BOLDCYAN}Building and installing source (PERL)${COLOR_RESET}"
+  export CONFIG="PREFIX=/usr"
+  # Do we have custom $CONFIG ? then overwrite it here...
+  if [[ -e ${CWD}/${NAME}-configure.sh ]]; then
+    source ${CWD}/${NAME}-configure.sh
+  elif [[ -e ${CWD}/configure.sh ]]; then
+    source ${CWD}/configure.sh
+  fi
+  echo -e "${BOLDCYAN}Configure options are : ${CONFIG} ${COLOR_RESET}"
+  sleep 2
+  perl Makefile.PL ${CONFIG} || exit 1
+  make
+  make install DESTDIR=${PKG}
+
+# CMAKE
+elif ls ./*[Cc][Mm]ake* ; then
+  echo -e "${BOLDCYAN}Building and installing source (CMAKE)${COLOR_RESET}"
+  export CONFIG="\
+-DCMAKE_POSITION_INDEPENDENT_CODE:BOOL=true \
+-DCMAKE_INSTALL_PREFIX:STRING=${PREFIX} \
+-DLIB_SUFFIX:STRING=64 \
+-DLIB_INSTALL_DIR:STRING=${LIBINSTALLDIR} \
+-DCMAKE_INSTALL_RPATH:STRING=${LIBINSTALLDIR} \
+-DWITH_DOCDIR:STRING=${PREFIX}/doc/${NAME}-${VERSION} \
+-DMAN_INSTALL_DIR:STRING=${PREFIX}/man \
+-DSYSCONF_INSTALL_DIR:STRING=/etc \
+-DINCLUDE_INSTALL_DIR:STRING=${PREFIX}/include \
+-DBUILD_SHARED_LIBS:BOOL=ON \
+-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+-DCMAKE_BUILD_TYPE=Release ${EXTRACONFIG} ..
+"
+  # Do we have custom $CONFIG ? then overwrite it here...
+  if [[ -e ${CWD}/${NAME}-configure.sh ]]; then
+    source ${CWD}/${NAME}-configure.sh
+  elif [[ -e ${CWD}/configure.sh ]]; then
+    source ${CWD}/configure.sh
+  fi
+  echo -e "${BOLDCYAN}Configure options are : ${CONFIG} ${COLOR_RESET}"
+  sleep 2
+  mkdir builddir
+  (
+    cd builddir
+    cmake ${CONFIG} || exit 1
+    makebuild
+  )
+
+# CLASSIC CONFIGURE (autotools, or a plain Makefile with no configure at all)
+else
+  echo -e "${BOLDCYAN}Building and installing source (standard MAKE)${COLOR_RESET}"
+  # Do we have custom $CONFIG ? then overwrite it here...
+  if [[ -e ${CWD}/${NAME}-configure.sh ]]; then
+    source ${CWD}/${NAME}-configure.sh
+  elif [[ -e ${CWD}/configure.sh ]]; then
+    source ${CWD}/configure.sh
+  fi
+  echo -e "${BOLDCYAN}Configure options are : ${CONFIG} ${COLOR_RESET}"
+  sleep 2
+  # No configure script yet? Try to generate one first
+  if [[ ! -e ${SRC}/configure ]]; then
+    ./autogen.sh || autoreconf -fiv
+  fi
+
+  if [[ -e ${SRC}/configure ]]; then
+    eval ./configure ${CONFIG} || exit 1
+    makebuild || exit 1
+  else
+    # pure Makefile ?
+    makebuild || exit 1
+  fi
+fi
+
+# Some build systems install under /usr/local instead of /usr — flatten
+# that back into the normal ${PREFIX} layout so the package is consistent.
+# In case local is used
+if [[ -d ${PKG}${PREFIX}/local/bin ]]; then
+  mkdir -p ${PKG}${PREFIX}/bin
+  mv ${PKG}${PREFIX}/local/bin/* ${PKG}${PREFIX}/bin/
+fi
+if [[ -d ${PKG}${PREFIX}/local/sbin ]]; then
+  mkdir -p ${PKG}${PREFIX}/sbin
+  mv ${PKG}${PREFIX}/local/sbin/* ${PKG}${PREFIX}/sbin/
+fi
+if [[ -d ${PKG}${PREFIX}/local/include ]]; then
+  mkdir -p ${PKG}${PREFIX}/include
+  mv ${PKG}${PREFIX}/local/include/* ${PKG}${PREFIX}/include/
+fi
+if [[ -d ${PKG}${PREFIX}/local/lib64 ]]; then
+  mkdir -p ${PKG}${PREFIX}/lib64
+  mv ${PKG}${PREFIX}/local/lib64/* ${PKG}${PREFIX}/lib64/
+fi
+if [[ -d ${PKG}${PREFIX}/local/lib ]]; then
+  mkdir -p ${PKG}${LIBINSTALLDIR}
+  mv ${PKG}${PREFIX}/local/lib/* ${PKG}${PREFIX}/lib64/
+fi
+rm -rf ${PKG}/usr/local
+
+# Debian-style multiarch installs into /usr/lib64/x86_64-linux-gnu — move
+# that content into ${LIBINSTALLDIR} (usr/lib64) instead, and fix up any
+# symlinks or text files (pkg-config files, libtool wrappers, etc.) that
+# still reference the old multiarch path.
+if [[ -d ${PKG}/usr/lib64/x86_64-linux-gnu ]]; then
+  mkdir -p ${PKG}${LIBINSTALLDIR}
+  mv ${PKG}/usr/lib64/x86_64-linux-gnu/* ${PKG}${LIBINSTALLDIR}
+  rmdir ${PKG}/usr/lib64/x86_64-linux-gnu
+  for file in $(find ${PKG} -type l) ; do
+    linktarget="$(ls -l ${file} | sed -e 's/.* -> \(.*\)$/\1/')"
+    if [[ "$(echo ${linktarget} | grep "lib/x86_64-linux-gnu/")" ]] ; then
+      newlinktarget="$(echo ${linktarget} | sed -e 's|lib/x86_64-linux-gnu/|lib64/|g')"
+      (
+        cd $(dirname "${file}")
+        unlink ${file}
+        ln -sf ${newlinktarget} ${file}
+      )
+    fi
+  done
+  for file in $(find ${PKG} -type f -exec grep -Iq . {} \; -print) ; do
+    if [[ "$(cat ${file} | grep "lib/x86_64-linux-gnu/")" ]] ; then
+      sed -i 's|lib/x86_64-linux-gnu/|usr/lib64/|g' ${file}
+    fi
+  done
+fi
+
+# Some upstream installers drop everything under /opt — relocate that
+# into ${LIBINSTALLDIR} too, again fixing up symlinks and text references.
+# In case /opt is used
+if [[ -d ${PKG}/opt ]]; then
+  mkdir -p ${PKG}${LIBINSTALLDIR}
+  mv ${PKG}/opt/* ${PKG}${LIBINSTALLDIR}
+  rmdir ${PKG}/opt
+  for file in $(find ${PKG} -type l) ; do
+    linktarget="$(ls -l ${file} | sed -e 's/.* -> \(.*\)$/\1/')"
+    if [[ "$(echo ${linktarget} | grep "opt/")" ]] ; then
+      newlinktarget="$(echo ${linktarget} | sed -e 's|opt/|usr/lib64/|g')"
+      (
+        cd $(dirname "${file}")
+        unlink ${file}
+        ln -sf ${newlinktarget} ${file}
+      )
+    fi
+  done
+  for file in $(find ${PKG} -type f -exec grep -Iq . {} \; -print) ; do
+    if [[ "$(cat ${file} | grep "opt/")" ]] ; then
+      sed -i 's|opt/|usr/lib64/|g' ${file}
+    fi
+  done
+fi
+
+# Finally, catch-all: fold any remaining ${PREFIX}/lib (32/64-agnostic
+# path some build systems still target) into ${PREFIX}/lib64, and rewrite
+# any leftover /usr/lib64/ references in text files to /usr/lib64/.
+# In case /usr/lib is linked or targeted
+mkdir -p ${PKG}${PREFIX}/lib64
+mv ${PKG}${PREFIX}/lib/* ${PKG}${PREFIX}/lib64 2> /dev/null
+rmdir ${PKG}${PREFIX}/lib ${PKG}${PREFIX}/lib64 2> /dev/null
+for file in $(find ${PKG}/${PREFIX} -type l) ; do
+  linktarget="$(ls -l ${file} | sed -e 's/.* -> \(.*\)$/\1/')"
+  if [[ "$(echo ${linktarget} | grep "/lib/")" ]] ; then
+    newlinktarget="$(echo ${linktarget} | sed -e 's|/lib/|/lib64/|g')"
+    (
+      cd $(dirname "${file}")
+      unlink ${file}
+      ln -sf ${newlinktarget} ${file}
+    )
+  fi
+done
+for file in $(find ${PKG}/${PREFIX} -type f -exec grep -Iq . {} \; -print) ; do
+  if [[ "$(cat ${file} | grep "/usr/lib64/")" ]] ; then
+    sed -i 's|/usr/lib64/|/usr/lib64/|g' ${file}
+  fi
+done
+
+# Copy standard doc files from the source tree, plus a copy of this
+# SlackBuild script itself and the pre/build/post-build scripts used,
+# so the package carries its own build recipe for reference.
+echo -e "${BOLDCYAN}Installing docs in ${PKG}${PREFIX}/doc/${NAME}-${VERSION} ${COLOR_RESET}"
+mkdir -p ${PKG}${PREFIX}/doc/${NAME}-${VERSION}
+(
+  cd ${SRC}
+  cp -f AUTHORS* LICENCE* COPYING* INSTALL README* TODO NEWS ChangeLog NOTICE Copyright Changelog documentation/* ${PKG}${PREFIX}/doc/${NAME}-${VERSION} 2> /dev/null
+  cat $ME > ${PKG}${PREFIX}/doc/${NAME}-${VERSION}/${NAME}.SlackBuild
+  [[ "${EXTRACONFIG}" != "" ]] && echo "${EXTRACONFIG}" > ${PKG}${PREFIX}/doc/${NAME}-${VERSION}/extraconfig
+)
+cp -f ${CWD}/${NAME}-prebuild.sh  ${PKG}${PREFIX}/doc/${NAME}-${VERSION}
+cp -f ${CWD}/${NAME}-build.sh  ${PKG}${PREFIX}/doc/${NAME}-${VERSION}
+cp -f ${CWD}/${NAME}-postbuild.sh  ${PKG}${PREFIX}/doc/${NAME}-${VERSION}
+
+# some custom post build instructions
+if [[ -e ${CWD}/${NAME}-postbuild.sh ]]; then
+  echo -e "${BOLDCYAN}Executing postbuild script${COLOR_RESET}"
+  bash ${CWD}/${NAME}-postbuild.sh
+elif [[ -e ${CWD}/postbuild.sh ]]; then
+  echo -e "${BOLDCYAN}Executing postbuild script ${COLOR_RESET}"
+  bash ${CWD}/postbuild.sh
+fi
+
+# Striptease #########################################################
+# Strip debug symbols from ELF binaries/shared objects and kernel modules,
+# drop leftover .la libtool files, and relocate man pages from
+# share/man to the plain ${PREFIX}/man layout, gzipping them.
+# Skipped entirely when STRIP=OFF (set above for AppImage packages).
+if [[ ! "$STRIP" == "OFF" ]]; then
+  (
+    cd ${PKG}
+    echo -e "${BOLDCYAN}Striping binaries${COLOR_RESET}"
+    find . | xargs file | grep "executable" | grep ELF | cut -f 1 -d : | xargs strip --strip-unneeded 2> /dev/null
+    find . | xargs file | grep "shared object" | grep ELF | cut -f 1 -d : | xargs strip --strip-unneeded 2> /dev/null
+    find lib/modules -name "*.ko" | xargs strip --strip-debug 2> /dev/null
+
+    echo -e "${BOLDCYAN}Removing .la files from ${PKG}${LIBINSTALLDIR} ${COLOR_RESET}"
+    find . -name *.la | xargs rm -f
+
+    echo -e "${BOLDCYAN}Installing man pages if any ${COLOR_RESET}"
+    for mandir in $(find .${PREFIX}/share/man -name man* -type d) ; do
+      mkdir -p .${PREFIX}/man/$(basename $mandir)
+      mv $mandir/*.? .${PREFIX}/man/$(basename $mandir)
+    done
+    rm -rf .${PREFIX}/share/man
+    for mandir in $(find . -name man -type d) ; do
+      if [[ -d $mandir ]]; then
+        (
+          cd $mandir
+          find . -type f -name "*.?" -exec gzip -9 {} \;
+        )
+      fi
+    done
+  )
+fi
+
+# redundant , if any (docs were already collected above into ${PREFIX}/doc)
+rm -rf ${PKG}${PREFIX}/share/doc
+rm -rf ${PKG}/usr/share/gtk-doc
+
+# Absolute symlinks (pointing at /usr/... on the build machine) would break
+# once the package is installed elsewhere, so rewrite them as relative
+# In case of absolute symlinks
+find "${PKG}" -type l | while read -r symlink; do
+  target=$(readlink "$symlink")
+  if [[ "$target" = /* ]]; then
+    symlink_dir=$(dirname "$symlink")
+    rel_target=$(realpath --relative-to="$symlink_dir" "$target")
+    echo "Converting: $symlink From: $target To: $rel_target"
+    rm -f "$symlink"
+    ln -s "$rel_target" "$symlink"
+  fi
+done
+
+##############################################################
+cd ${CWD}
+
+# slack-desc, doinst.sh
+mkdir -p ${PKG}/install
+
+cat > ${PKG}/install/slack-desc << END
+${NAME}: Zenwalk package for ${NAME}
+${NAME}:
+${NAME}: This ${NAME} package was created for Zenwalk GNU Linux.
+${NAME}: It can be installed on any Slackware Linux system.
+${NAME}:
+${NAME}: For more information, see:  http://www.zenwalk.org
+${NAME}:
+${NAME}:
+${NAME}:
+${NAME}:
+${NAME}:
+END
+
+# A NAME-slack-desc or slack-desc file next to the script always wins.
+# Failing that, try to fetch an existing slack-desc from the network:
+# first from the official Slackware source tree (category unknown, so
+# probe every category directory with a HEAD-only --spider request until
+# one exists), then from SlackBuilds.org as a second-choice mirror. Any
+# fetched slack-desc is cached locally as NAME-slack-desc for next time.
+if [[ -e ${CWD}/${NAME}-slack-desc ]]; then
+  echo -e "${BOLDCYAN}Installing slack-desc${COLOR_RESET}"
+  cat ${CWD}/${NAME}-slack-desc > ${PKG}/install/slack-desc
+elif [[ -e ${CWD}/slack-desc ]]; then
+  echo -e "${BOLDCYAN}Installing slack-desc${COLOR_RESET}"
+  cat ${CWD}/slack-desc > ${PKG}/install/slack-desc
+else
+  echo -e "${BOLDCYAN}looking up for existing slack-desc on Internet.....${COLOR_RESET}"
+  # Probe each Slackware source category until --spider finds a hit.
+  # $i is left set to the matching category (or the last one tried, if
+  # none matched) for the wget below.
+  for i in a ap d l n x xap xfce kde ; do
+    wget -q --spider --no-check-certificate --timeout=20 http://mirrors.slackware.com/slackware/slackware64-current/source/$i/$NAME/slack-desc && break
+  done
+  if [[ "$?" = "0" ]] ; then
+    wget --no-check-certificate --timeout=20 -O ${PKG}/install/slack-desc http://mirrors.slackware.com/slackware/slackware64-current/source/$i/$NAME/slack-desc
+    cat ${PKG}/install/slack-desc > ${CWD}/${NAME}-slack-desc
+  else
+    # Not an official Slackware package: try SlackBuilds.org categories instead
+    for i in academic accessibility audio business desktop development games gis graphics libraries misc multimedia network office perl python ruby system ; do
+      wget -q --spider --no-check-certificate --timeout=20 https://slackbuilds.org/slackbuilds/15.0/$i/$NAME/slack-desc && break
+    done
+    if [[ "$?" = "0" ]] ; then
+      wget --no-check-certificate --timeout=20 -O ${PKG}/install/slack-desc https://slackbuilds.org/slackbuilds/15.0/$i/$NAME/slack-desc
+      cat ${PKG}/install/slack-desc > ${CWD}/${NAME}-slack-desc
+    fi
+  fi
+fi
+
+# Build install/doinst.sh, the script Slackware's pkgtools runs right
+# after installing the package. Each conditional below appends a snippet
+# only if the package actually ships the relevant files, so packages that
+# don't need a given cache refresh don't pay for it at install time.
+echo -e "${BOLDCYAN}Installing post-install script doinst.sh${COLOR_RESET}"
+
+echo "" > ${PKG}/install/doinst.sh
+
+# Refresh the desktop-file (.desktop) database, if this package ships any
+if [[ -e ${PKG}/${PREFIX}/share/applications ]]; then
+  cat >> ${PKG}/install/doinst.sh << END
+if [[ -x ${PREFIX}/bin/update-desktop-database ]]; then
+  ${PREFIX}/bin/update-desktop-database -q ${PREFIX}/share/applications >/dev/null 2>&1
+fi
+END
+fi
+
+# Refresh the GTK icon theme cache, under the same condition as above
+# (note: this really should check for an icon-theme.cache file, not
+# share/applications again — left as-is to avoid changing behavior)
+if [[ -e ${PKG}/${PREFIX}/share/applications ]]; then
+  cat >> ${PKG}/install/doinst.sh << END
+if [[ -e usr/share/icons/hicolor/icon-theme.cache ]]; then
+  if [[ -x ${PREFIX}/bin/gtk-update-icon-cache ]]; then
+    ${PREFIX}/bin/gtk-update-icon-cache ${PREFIX}/share/icons/hicolor >/dev/null 2>&1
+  fi
+fi
+END
+fi
+
+# Recompile GLib schemas / GIO modules, if this package ships any
+if [[ -e ${PKG}/${PREFIX}/share/glib-2.0/schemas ]]; then
+  cat >> ${PKG}/install/doinst.sh << END
+chroot . ${PREFIX}/bin/glib-compile-schemas ${PREFIX}/share/glib-2.0/schemas/ > /dev/null 2>&1
+chroot . ${PREFIX}/bin/gio-querymodules ${PREFIX}/lib64/gio/modules/ > /dev/null 2>&1
+END
+fi
+
+# Rename every file under etc/ to *.new, so pkgtools never silently
+# overwrites an admin's existing config file on install. A file can opt
+# out by being named *.notnew in the package tree (that suffix is
+# stripped instead of appending .new), for configs that are always safe
+# to overwrite.
+(
+  cd ${PKG}
+  for f in $(find etc -type f) ; do
+    if [[ $f == *.notnew ]] ; then
+      mv $f ${f%.*}
+      continue
+    fi
+    mv $f $f.new
+  done
+)
+
+# Append the classic Slackware config() helper: on install, a *.new file
+# is only kept as .new (for the admin to review) if an old config exists
+# and differs; otherwise it's installed in place or dropped as redundant.
+cat << "END" >> ${PKG}/install/doinst.sh
+config() {
+  NEW="$1"
+  OLD="$(dirname $NEW)/$(basename $NEW .new)"
+  # If there's no config file by that name, mv it over:
+  if [[ ! -r $OLD ]]; then
+    mv $NEW $OLD
+  elif [[ "$(cat $OLD | md5sum)" = "$(cat $NEW | md5sum)" ]]; then
+    # toss the redundant copy
+    rm $NEW
+  fi
+  # Otherwise, we leave the .new copy for the admin to consider...
+}
+END
+
+# Call config() for every *.new file the package actually ships
+(
+  cd ${PKG}
+  for dotnew in $(find . -type f -name "*.new") ; do
+    cat >> ${PKG}/install/doinst.sh << END
+config ${dotnew#./}
+END
+  done
+)
+
+# Append any fully custom doinst.sh content on top of everything generated above
+if [[ -e ${CWD}/${NAME}-doinst.sh ]]; then
+  cat ${CWD}/${NAME}-doinst.sh >> ${PKG}/install/doinst.sh
+elif [[ -e ${CWD}/doinst.sh ]]; then
+  cat ${CWD}/doinst.sh >> ${PKG}/install/doinst.sh
+fi
+
+# Normalize ownership/permissions before packaging: root:root everywhere,
+# and no world-writable or overly-permissive setuid/setgid bits sneak in
+echo -e "${BOLDCYAN}Creating package...${COLOR_RESET}"
+cd ${PKG}
+chown -R root.root .
+find . -perm 0777 -exec chmod 755 {} \;
+find . -perm 0775 -exec chmod 755 {} \;
+find . -perm 0666 -exec chmod 644 {} \;
+find . -perm 0664 -exec chmod 644 {} \;
+find . -perm 4777 -exec chmod 4755 {} \;
+find . -perm 4775 -exec chmod 4755 {} \;
+
+# Actually build the .txz package from ${PKG}
+makepkg -l y -c n "${OUTPUT:=/tmp}/${NAME}-${VERSION}-${ARCH}-$BUILD.txz"
+
+cat ${PKG}/install/slack-desc
+
+# Optionally generate a .dep file listing runtime dependencies, if the
+# requiredbuilder tool is installed
+if [[ -x /usr/bin/requiredbuilder ]]; then
+  echo -e "${BOLDCYAN}Generating dependecy file ${NAME}-${VERSION}-${ARCH}-$BUILD.dep ${COLOR_RESET}"
+  /usr/bin/requiredbuilder -z "${OUTPUT:=/tmp}/${NAME}-${VERSION}-${ARCH}-$BUILD.txz" > "${OUTPUT:=/tmp}/${NAME}-${VERSION}-${ARCH}-$BUILD.dep"
+fi
+
+# Cleanup: remove the staging root now that the .txz is built.
+# ${TMP} (the extracted source) is left behind for inspection/debugging.
+cd ${CWD}
+rm -rf ${PKG}
+# rm -rf ${TMP}
