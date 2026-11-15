@@ -1,5 +1,7 @@
 #!/bin/bash
 #
+# zenbuild - universal Slackware package builder
+#
 # Copyright 2004, ..., 2017  Jean-Philippe Guillemin <hyp3ri0n@sfr.fr>
 # All rights reserved.
 #
@@ -43,7 +45,7 @@ die() {
 }
 
 usage() {
-  echo -e "${BOLDCYAN}Usage: $0 [OPTIONS] SOURCE [VERSION] [NAME]${COLOR_RESET}"
+  echo -e "${BOLDCYAN}Usage: zenbuild [OPTIONS] SOURCE [VERSION] [NAME]${COLOR_RESET}"
   echo -e "${BOLDCYAN}  SOURCE can be a source archive, a .deb/.rpm/.txz/.AppImage,${COLOR_RESET}"
   echo -e "${BOLDCYAN}  or a .git/.url/.pip/.pkg/.skel recipe.${COLOR_RESET}"
   echo
@@ -745,21 +747,29 @@ if [[ "${LIBDIRSUFFIX}" == "64" ]]; then
   done
 fi
 
-# Copy standard doc files from the source tree, plus a copy of this
-# SlackBuild script itself and the pre/build/post-build scripts used,
-# so the package carries its own build recipe for reference.
+# Copy standard doc files from the source tree, plus the hooks and patches
+# used by this build. The zenbuild script itself is not installed.
 DOCDIR="${PKG}${PREFIX}/doc/${NAME}-${VERSION}"
 echo -e "${BOLDCYAN}Installing docs in ${DOCDIR} ${COLOR_RESET}"
 mkdir -p "${DOCDIR}"
 (
   cd "${SRC}" || exit 1
   cp -f AUTHORS* LICENCE* COPYING* INSTALL README* TODO NEWS ChangeLog NOTICE Copyright Changelog documentation/* "${DOCDIR}" 2>/dev/null
-  cat "${ME}" > "${DOCDIR}/${NAME}.SlackBuild"
-  [[ -n "${EXTRACONFIG}" ]] && echo "${EXTRACONFIG}" > "${DOCDIR}/extraconfig"
 )
-[[ -e "${CWD}/${NAME}-prebuild.sh" ]] && cp -f "${CWD}/${NAME}-prebuild.sh" "${DOCDIR}/"
-[[ -e "${CWD}/${NAME}-build.sh" ]] && cp -f "${CWD}/${NAME}-build.sh" "${DOCDIR}/"
-[[ -e "${CWD}/${NAME}-postbuild.sh" ]] && cp -f "${CWD}/${NAME}-postbuild.sh" "${DOCDIR}/"
+
+for hook in \
+  "${CWD}/${NAME}-prebuild.sh" "${CWD}/prebuild.sh" \
+  "${CWD}/${NAME}-configure.sh" "${CWD}/configure.sh" \
+  "${CWD}/${NAME}-build.sh" "${CWD}/build.sh" \
+  "${CWD}/${NAME}-postbuild.sh" "${CWD}/postbuild.sh" \
+  "${CWD}/${NAME}-doinst.sh" "${CWD}/doinst.sh" \
+  "${CWD}/${NAME}-slack-desc" "${CWD}/slack-desc"; do
+  [[ -e "${hook}" ]] && cp -f "${hook}" "${DOCDIR}/"
+done
+
+for patch in "${CWD}"/*.patch "${CWD}"/*.diff; do
+  [[ -e "${patch}" ]] && cp -f "${patch}" "${DOCDIR}/"
+done
 
 # some custom post build instructions
 if [[ -e "${CWD}/${NAME}-postbuild.sh" ]]; then
@@ -837,7 +847,7 @@ ${NAME}: ${NAME} ${VERSION}
 ${NAME}:
 ${NAME}: ${NAME} package for Slackware Linux.
 ${NAME}:
-${NAME}: Built with SlackBuild from ${SRCPKG}.
+${NAME}: Built with zenbuild from ${SRCPKG}.
 ${NAME}:
 ${NAME}:
 ${NAME}:

@@ -1,4 +1,4 @@
-# SlackBuild
+# zenbuild
 
 A universal Slackware package builder. It creates a `.txz` package from a
 source archive, a binary package, a recipe, or a source tree.
@@ -9,7 +9,7 @@ files.
 ## Usage
 
 ```sh
-./SlackBuild [OPTIONS] SOURCE [VERSION] [NAME]
+./zenbuild [OPTIONS] SOURCE [VERSION] [NAME]
 ```
 
 `SOURCE` can be:
@@ -23,12 +23,12 @@ files.
 Examples:
 
 ```sh
-./SlackBuild foo-1.2.3.tar.gz
-./SlackBuild foo-1.2.3.tar.gz 1.2.3 foo
-./SlackBuild -o /tmp/packages foo.url
-./SlackBuild -s meson foo-1.2.3.tar.xz
-./SlackBuild mpv-MASTER-0.42.0.git
-./SlackBuild mpv.git MASTER
+./zenbuild foo-1.2.3.tar.gz
+./zenbuild foo-1.2.3.tar.gz 1.2.3 foo
+./zenbuild -o /tmp/packages foo.url
+./zenbuild -s meson foo-1.2.3.tar.xz
+./zenbuild mpv-MASTER-0.42.0.git
+./zenbuild mpv.git MASTER
 ```
 
 ## Options
@@ -56,7 +56,7 @@ resulting `.txz` package.
 To disable this behavior:
 
 ```sh
-NO_FAKEROOT=1 ./SlackBuild ...
+NO_FAKEROOT=1 ./zenbuild ...
 ```
 
 If `fakeroot` is not installed, or if `NO_FAKEROOT=1` is used by a non-root
@@ -165,7 +165,9 @@ make install DESTDIR="$PKG" || exit 1
 
 - Package filename: `name-version-arch-build.txz`.
 - Hyphens in `VERSION` become underscores in the package filename.
-- Documentation is installed in `/usr/doc/name-version`.
+- Documentation is installed in `/usr/doc/name-version`. The `zenbuild`
+  script itself is not copied there; hooks and patch files are copied when
+  present.
 - Man pages are moved to `/usr/man` and gzipped.
 - Files under `/etc` are installed as `*.new`; a generated `config()` helper
   in `doinst.sh` handles upgrades. A file named `*.notnew` is installed
