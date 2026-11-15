@@ -46,6 +46,23 @@ Examples:
 
 Options may appear before or after `SOURCE`.
 
+## Unprivileged builds
+
+If the script is run as a normal user and `fakeroot` is available, it
+re-executes itself under `fakeroot`. This gives the build a fake root
+identity, so `chown` and `makepkg` record `root:root` ownership in the
+resulting `.txz` package.
+
+To disable this behavior:
+
+```sh
+NO_FAKEROOT=1 ./SlackBuild ...
+```
+
+If `fakeroot` is not installed, or if `NO_FAKEROOT=1` is used by a non-root
+user, the script prints a warning and the package ownership may not be
+`root:root`.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -62,6 +79,7 @@ Options may appear before or after `SOURCE`.
 | `CMAKEFLAGS` | empty | Extra CMake flags |
 | `EXTRACONFIG` | empty | Extra configure/CMake/Meson options |
 | `STRIP` | `ON` | Set to `OFF` to skip stripping |
+| `NO_FAKEROOT` | `0` | Set to `1` to disable automatic fakeroot |
 
 `VERSION` and `NAME` can also be supplied from the environment, but the
 positional arguments are preferred.
@@ -166,7 +184,8 @@ make install DESTDIR="$PKG" || exit 1
 
 ## Notes
 
-- `makepkg` from Slackware's pkgtools is required.
+- `makepkg` from Slackware's pkgtools is required. `/sbin`, `/usr/sbin`, and
+  `/usr/local/sbin` are added to `PATH` automatically so `makepkg` is found.
 - The extracted source is left in `./tmp` for inspection.
 - The staging directory is removed after a successful build.
 - `TMP` is always `./tmp`; it is not read from the environment.

@@ -28,6 +28,15 @@ export CWD="$(pwd)"
 export ME="$(readlink -f "${BASH_SOURCE[0]}")"
 export JOBS="${JOBS:-$(nproc 2>/dev/null || echo 1)}"
 
+# Slackware pkgtools (makepkg) commonly live in /sbin or /usr/sbin.
+for dir in /sbin /usr/sbin /usr/local/sbin; do
+  case ":${PATH}:" in
+    *":${dir}:"*) ;;
+    *) PATH="${PATH:+${PATH}:}${dir}" ;;
+  esac
+done
+export PATH
+
 die() {
   echo -e "${BOLDRED}Error:${COLOR_RESET} $*" >&2
   exit 1
@@ -46,10 +55,12 @@ usage() {
   echo "  -h, --help             show this help"
   echo
   echo -e "${BOLDCYAN}Environment: OUTPUT VERSION NAME BUILD EXTRACONFIG${COLOR_RESET}"
+  echo "  NO_FAKEROOT=1 disables automatic fakeroot"
 }
 
 buildSystem="auto"
 positional=()
+ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -100,6 +111,19 @@ esac
 
 [[ ${#positional[@]} -ge 1 ]] || { usage; exit 1; }
 [[ ${#positional[@]} -le 3 ]] || die "Too many arguments (expected SOURCE [VERSION] [NAME])"
+
+# Build system packages as an unprivileged user. fakeroot gives the build
+# a fake root identity, so chown and makepkg record root:root ownership.
+if [[ "${NO_FAKEROOT:-0}" != "1" && "${EUID}" -ne 0 && -z "${FAKEROOTKEY:-}" ]]; then
+  if command -v fakeroot >/dev/null 2>&1; then
+    echo -e "${BOLDCYAN}Re-executing under fakeroot...${COLOR_RESET}" >&2
+    exec fakeroot -- bash "${ME}" "${ORIG_ARGS[@]}"
+  else
+    echo -e "${BOLDYELLOW}Warning:${COLOR_RESET} fakeroot not found; package ownership may not be root:root" >&2
+  fi
+elif [[ "${NO_FAKEROOT:-0}" == "1" && "${EUID}" -ne 0 && -z "${FAKEROOTKEY:-}" ]]; then
+  echo -e "${BOLDYELLOW}Warning:${COLOR_RESET} NO_FAKEROOT=1; package ownership may not be root:root" >&2
+fi
 
 export SRCPKG="$(basename "${positional[0]}")"
 [[ ${#positional[@]} -ge 2 && -z "${VERSION:-}" ]] && export VERSION="${positional[1]}"
@@ -946,6 +970,8 @@ chmod 755 install/doinst.sh 2>/dev/null
 
 PKGFILE="${OUTPUT}/${NAME}-${PKG_VERSION}-${ARCH}-${BUILD}.txz"
 [[ "${PKGFILE}" != "${CWD}/${SRCPKG}" ]] || die "Refusing to overwrite the source package"
+command -v makepkg >/dev/null 2>&1 \
+  || die "makepkg not found; ensure /sbin and /usr/sbin are in PATH"
 rm -f "${PKGFILE}"
 makepkg -l y -c n "${PKGFILE}" || exit 1
 
