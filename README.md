@@ -29,6 +29,7 @@ Examples:
 ./zenbuild -s meson foo-1.2.3.tar.xz
 ./zenbuild mpv-MASTER-0.42.0.git
 ./zenbuild mpv.git MASTER
+./zenbuild requests-LATEST.pip
 ```
 
 ## Installation
@@ -129,7 +130,7 @@ Binary package handling is built into the build stage; no temporary
 | `.rpm` | `rpm2cpio` + `cpio` into `$PKG` |
 | `.AppImage` | `--appimage-extract`, install binary, desktop file, icon |
 | `.txz` | extract package into `$PKG`; run its `doinst.sh` |
-| `.pip` | install PyPI module `$NAME` with `pip --root $PKG` |
+| `.pip` | install PyPI module `$NAME`; `NAME-LATEST.pip` queries PyPI for the latest version |
 | `.skel` | copy the `*.skel` directory into `$PKG` |
 | `.pkg` | requires a custom `NAME-build.sh` |
 
@@ -140,7 +141,10 @@ Recipe files:
   - `LATEST` checks out the latest tag, or the tag in the second field.
   - Any other value is treated as a tag.
 - `.url`: first field is the download URL.
-- `.pip`: installs a PyPI module named `$NAME`.
+- `.pip`: installs a PyPI module named `$NAME`. A recipe named
+  `NAME-LATEST.pip` (or `NAME-latest.pip`) queries the PyPI JSON API for the
+  latest version and uses it as `$VERSION`. The lookup requires `python3` and
+  network access.
 - `.pkg`: no built-in unpacking; provide `NAME-build.sh`.
 
 Prebuilt `.txz` packages keep their existing `slack-desc` and `doinst.sh`.

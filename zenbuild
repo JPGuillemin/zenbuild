@@ -169,6 +169,9 @@ if [[ -z "${NAME:-}" ]]; then
     if [[ "${SRCPKG}" == *.git && "${base}" =~ ^(.+)-(MASTER|LATEST)(-.*)?$ ]]; then
       NAME="${BASH_REMATCH[1]}"
       [[ -z "${VERSION:-}" ]] && VERSION="${BASH_REMATCH[2]}"
+    elif [[ "${SRCPKG}" == *.pip && "${base}" =~ ^(.+)-([Ll][Aa][Tt][Ee][Ss][Tt])$ ]]; then
+      NAME="${BASH_REMATCH[1]}"
+      [[ -z "${VERSION:-}" ]] && VERSION="LATEST"
     elif [[ "${base}" =~ ^(.+)-([0-9][A-Za-z0-9._+~-]*)$ ]]; then
       NAME="${BASH_REMATCH[1]}"
       [[ -z "${VERSION:-}" ]] && VERSION="${BASH_REMATCH[2]}"
@@ -205,7 +208,9 @@ export BUILD
 # understand MASTER and LATEST (see the git extraction branch below).
 if [[ -z "${VERSION:-}" ]]; then
   base="$(stripSourceExt "${SRCPKG}")"
-  if [[ "${SRCPKG}" == *.git ]]; then
+  if [[ "${SRCPKG}" == *.pip && "${base}" =~ ^(.+)-([Ll][Aa][Tt][Ee][Ss][Tt])$ ]]; then
+    VERSION="LATEST"
+  elif [[ "${SRCPKG}" == *.git ]]; then
     if [[ "${base}" =~ ^(.+)-(MASTER|LATEST)(-.*)?$ ]]; then
       VERSION="${BASH_REMATCH[2]}"
     else
@@ -213,6 +218,8 @@ if [[ -z "${VERSION:-}" ]]; then
     fi
   elif [[ "${base}" =~ ^(.+)-([0-9][A-Za-z0-9._+~-]*)$ ]]; then
     VERSION="${BASH_REMATCH[2]}"
+  elif [[ "${SRCPKG}" == *.pip ]]; then
+    VERSION="LATEST"
   else
     VERSION="${base##*-}"
   fi
@@ -257,6 +264,36 @@ gitCheckoutTag() {
   git checkout "tags/v${tag}" 2>/dev/null || \
   git checkout "${tag}" 2>/dev/null || \
   git checkout "v${tag}" || exit 1
+}
+
+getPypiVersion() {
+  local module="$1"
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is required to query PyPI"
+
+  python3 - "${module}" <<'PY'
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+name = sys.argv[1]
+url = "https://pypi.org/pypi/{}/json".format(urllib.parse.quote(name))
+
+try:
+    with urllib.request.urlopen(url, timeout=30) as response:
+        data = json.load(response)
+    version = data["info"]["version"]
+except Exception as exc:
+    print("PyPI lookup failed for {}: {}".format(name, exc), file=sys.stderr)
+    sys.exit(1)
+
+if not version:
+    print("PyPI returned an empty version for {}".format(name), file=sys.stderr)
+    sys.exit(1)
+
+print(version)
+PY
 }
 
 # Dispatch on the source package's extension. Plain archives (gz/xz/bz2/zip)
@@ -317,6 +354,12 @@ rpm|deb|AppImage|appimage|skel|txz|pip|pkg)
   if [[ "${SOURCE_TYPE}" == "pip" ]]; then
     MODULE="${NAME}"
     export MODULE
+    if [[ "${VERSION^^}" == "LATEST" ]]; then
+      echo -e "${BOLDCYAN}Looking up latest PyPI version for ${MODULE}...${COLOR_RESET}"
+      VERSION="$(getPypiVersion "${MODULE}")" \
+        || die "Could not determine the latest version for ${MODULE} from PyPI"
+      export VERSION
+    fi
   fi
   ;;
 *)
@@ -428,13 +471,13 @@ buildPython() {
   if [[ -e "${SRC}/setup.py" ]]; then
     ( cd "${SRC}" && python3 setup.py install ${CONFIG} ) || exit 1
   else
-    ( cd "${SRC}" && python3 -m pip install --no-deps --root "${PKG}" --prefix "${PREFIX}" . ) || exit 1
+    ( cd "${SRC}" && python3 -m pip install --ignore-installed --no-deps --root "${PKG}" --prefix "${PREFIX}" . ) || exit 1
   fi
 }
 
 buildPip() {
   echo -e "${BOLDCYAN}Building and installing source (PIP)${COLOR_RESET}"
-  ( cd "${SRC}" && python3 -m pip install --no-deps --root "${PKG}" --prefix "${PREFIX}" . ) || exit 1
+  ( cd "${SRC}" && python3 -m pip install --ignore-installed --no-deps --root "${PKG}" --prefix "${PREFIX}" . ) || exit 1
 }
 
 buildRpm() {
@@ -498,7 +541,7 @@ buildTxz() {
 
 buildPipSource() {
   echo -e "${BOLDCYAN}Installing Python module${COLOR_RESET}"
-  python3 -m pip install --no-deps --root "${PKG}" --prefix "${PREFIX}" "${MODULE}" || exit 1
+  python3 -m pip install --ignore-installed --no-deps --root "${PKG}" --prefix "${PREFIX}" "${MODULE}" || exit 1
 }
 
 buildPerl() {
