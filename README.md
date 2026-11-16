@@ -31,6 +31,27 @@ Examples:
 ./zenbuild mpv.git MASTER
 ```
 
+## Installation
+
+Install `zenbuild` into `/usr/bin`:
+
+```sh
+make install
+```
+
+Install into a staging directory:
+
+```sh
+make install DESTDIR=/tmp/zenbuild-pkg
+```
+
+`PREFIX`, `BINDIR`, `DESTDIR`, `SCRIPT`, and `INSTALL` can all be overridden:
+
+```sh
+make install PREFIX=/usr/local DESTDIR=/tmp/pkg
+make uninstall DESTDIR=/tmp/pkg
+```
+
 ## Options
 
 | Option | Description |
